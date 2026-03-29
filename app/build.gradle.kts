@@ -19,14 +19,36 @@ android {
     }
 
     buildTypes {
+        getByName("debug") {
+            // Memastikan penyelarasan 16KB di build debug
+            packaging {
+                jniLibs {
+                    useLegacyPackaging = true
+                }
+            }
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // Memastikan penyelarasan 16KB di build release
+            packaging {
+                jniLibs {
+                    useLegacyPackaging = true
+                }
+            }
         }
     }
+    
+    // Konfigurasi khusus untuk penyelarasan 16 KB
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
@@ -39,6 +61,7 @@ android {
 dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.lifecycle.service)
     implementation(libs.androidx.activity.compose)
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.compose.ui)
@@ -49,6 +72,15 @@ dependencies {
     // Firebase Dependencies
     implementation(platform(libs.firebase.bom))
     implementation(libs.firebase.database.ktx)
+
+    // CameraX
+    implementation(libs.androidx.camera.core)
+    implementation(libs.androidx.camera.camera2)
+    implementation(libs.androidx.camera.lifecycle)
+    implementation(libs.androidx.camera.view)
+
+    // ML Kit
+    implementation(libs.mlkit.face.detection)
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)

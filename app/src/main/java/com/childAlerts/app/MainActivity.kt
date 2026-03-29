@@ -84,11 +84,13 @@ fun MainScreen() {
     val switchRef = remember { database.getReference("switch/active") }
     val timerRef = remember { database.getReference("timer") }
     val mediaRef = remember { database.getReference("media") }
+    val safetyRef = remember { database.getReference("settings/faceSafety") }
 
     var isActive by remember { mutableStateOf(false) }
     var timerValue by remember { mutableLongStateOf(0L) }
     var timerType by remember { mutableStateOf("minutes") }
     var mediaType by remember { mutableStateOf("image") }
+    var faceSafetyEnabled by remember { mutableStateOf(false) }
 
     var showBottomSheet by remember { mutableStateOf(false) }
     val sheetState = rememberModalBottomSheetState(
@@ -103,16 +105,31 @@ fun MainScreen() {
             } else true
         )
     }
+    
+    var hasCameraPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        )
+    }
 
     val launcher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { isGranted ->
-        hasNotificationPermission = isGranted
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        hasNotificationPermission = permissions[Manifest.permission.POST_NOTIFICATIONS] ?: hasNotificationPermission
+        hasCameraPermission = permissions[Manifest.permission.CAMERA] ?: hasCameraPermission
     }
 
     LaunchedEffect(Unit) {
+        val permissionsToRequest = mutableListOf<String>()
         if (!hasNotificationPermission && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            launcher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            permissionsToRequest.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        if (!hasCameraPermission) {
+            permissionsToRequest.add(Manifest.permission.CAMERA)
+        }
+        
+        if (permissionsToRequest.isNotEmpty()) {
+            launcher.launch(permissionsToRequest.toTypedArray())
         }
         
         // Check Overlay Permission
@@ -145,6 +162,13 @@ fun MainScreen() {
         mediaRef.addValueEventListener(object : ValueEventListener {
             override fun onDataChange(snapshot: DataSnapshot) {
                 mediaType = snapshot.child("type").getValue(String::class.java) ?: "image"
+            }
+            override fun onCancelled(error: DatabaseError) {}
+        })
+
+        safetyRef.addValueEventListener(object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                faceSafetyEnabled = snapshot.child("enabled").getValue(Boolean::class.java) ?: false
             }
             override fun onCancelled(error: DatabaseError) {}
         })
@@ -228,7 +252,7 @@ fun MainScreen() {
             )
 
             Text(
-                text = "Timer: $timerValue $timerType | Media: $mediaType",
+                text = "Timer: $timerValue $timerType | Face Safety: ${if(faceSafetyEnabled) "ON" else "OFF"}",
                 color = Color.White.copy(alpha = 0.7f),
                 fontSize = 14.sp,
                 modifier = Modifier.padding(top = 8.dp)
@@ -264,9 +288,11 @@ fun MainScreen() {
                     currentValue = timerValue,
                     currentType = timerType,
                     currentMediaType = mediaType,
-                    onSave = { newValue, newType, newMediaType ->
+                    isFaceSafetyEnabled = faceSafetyEnabled,
+                    onSave = { newValue, newType, newMediaType, newFaceSafety ->
                         timerRef.updateChildren(mapOf("value" to newValue, "type" to newType))
                         mediaRef.updateChildren(mapOf("type" to newMediaType))
+                        safetyRef.updateChildren(mapOf("enabled" to newFaceSafety))
                         showBottomSheet = false
                     }
                 )
@@ -286,11 +312,13 @@ fun TimerSettingsContent(
     currentValue: Long,
     currentType: String,
     currentMediaType: String,
-    onSave: (Long, String, String) -> Unit
+    isFaceSafetyEnabled: Boolean,
+    onSave: (Long, String, String, Boolean) -> Unit
 ) {
     var textValue by remember { mutableStateOf(currentValue.toString()) }
     var selectedType by remember { mutableStateOf(currentType) }
     var selectedMediaType by remember { mutableStateOf(currentMediaType) }
+    var faceSafetyEnabled by remember { mutableStateOf(isFaceSafetyEnabled) }
     
     val timerTypes = listOf("minutes", "hours")
     val mediaTypes = listOf("image", "video")
@@ -350,13 +378,31 @@ fun TimerSettingsContent(
                 Text(text = type.replaceFirstChar { it.uppercase() }, color = Color.White, modifier = Modifier.padding(start = 8.dp))
             }
         }
+
+        Spacer(modifier = Modifier.height(16.dp))
+        
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column {
+                Text(text = "Face Safety Range", color = Color.White, fontWeight = FontWeight.Medium)
+                Text(text = "Detects if phone is too close", color = Color.Gray, fontSize = 12.sp)
+            }
+            Switch(
+                checked = faceSafetyEnabled,
+                onCheckedChange = { faceSafetyEnabled = it },
+                colors = SwitchDefaults.colors(checkedThumbColor = Color(0xFF81D4FA))
+            )
+        }
         
         Spacer(modifier = Modifier.height(32.dp))
         
         Button(
             onClick = {
                 val value = textValue.toLongOrNull() ?: 0L
-                onSave(value, selectedType, selectedMediaType)
+                onSave(value, selectedType, selectedMediaType, faceSafetyEnabled)
             },
             modifier = Modifier.fillMaxWidth(),
             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF81D4FA)),
