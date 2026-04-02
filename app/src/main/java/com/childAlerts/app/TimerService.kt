@@ -9,8 +9,11 @@ import android.graphics.PixelFormat
 import android.net.Uri
 import android.os.Build
 import android.os.CountDownTimer
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
+import android.util.Size
 import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.View
@@ -32,6 +35,7 @@ import com.google.firebase.ktx.Firebase
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
+import com.google.mlkit.vision.face.FaceLandmark
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -43,6 +47,7 @@ class TimerService : LifecycleService() {
     private var batteryOverlayView: View? = null
     private var windowManager: WindowManager? = null
     
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val CHANNEL_ID = "TimerServiceChannel"
     private val NOTIFICATION_ID = 1
 
@@ -53,6 +58,7 @@ class TimerService : LifecycleService() {
     private val callRef = database.getReference("call")
     private val safetyRef = database.getReference("settings/faceSafety")
     private val lowBatteryRef = database.getReference("settings/lowBattery")
+    private val typeFaceRef = database.getReference("type_face")
 
     private var isActive = false
     private var timerValue = 0L
@@ -60,21 +66,25 @@ class TimerService : LifecycleService() {
     private var mediaType = "image"
     private var faceSafetyEnabled = false
     private var lowBatteryEnabled = false
+    private var typeFace = "ghost"
 
     private var isTimerPaused = false
     private var timeRemaining = 0L
+    private var isCameraStarted = false
+    private var isProximityActive = false
+    
+    // Interval 200ms (5 FPS) agar responsif tapi tidak panas
+    private var lastAnalysisTime = 0L
+    private val analysisInterval = 200L 
+    
+    private var faceLostCount = 0
+    private val MAX_FACE_LOST = 2 
 
     private lateinit var cameraExecutor: ExecutorService
     private var cameraProvider: ProcessCameraProvider? = null
 
-    private val autoCloseRunnable = Runnable {
-        if (overlayView != null) {
-            removeOverlay()
-        }
-    }
-
+    private val autoCloseRunnable = Runnable { removeOverlay() }
     private val batteryAutoCloseRunnable = Runnable {
-        // Setelah 3 menit, ubah enabled jadi false di Firebase (ini akan memicu removeBatteryOverlay via listener)
         lowBatteryRef.child("enabled").setValue(false)
     }
 
@@ -83,7 +93,7 @@ class TimerService : LifecycleService() {
         createNotificationChannel()
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         cameraExecutor = Executors.newSingleThreadExecutor()
-        
+        updateNotification("Child Alert Service is Running")
         listenToFirebase()
     }
 
@@ -94,7 +104,6 @@ class TimerService : LifecycleService() {
                 if (isActive != newIsActive) {
                     isActive = newIsActive
                     resetTimer()
-                    updateCameraState()
                 }
             }
             override fun onCancelled(error: DatabaseError) {}
@@ -104,7 +113,6 @@ class TimerService : LifecycleService() {
             override fun onDataChange(snapshot: DataSnapshot) {
                 val newValue = snapshot.child("value").getValue(Long::class.java) ?: 0L
                 val newType = snapshot.child("type").getValue(String::class.java) ?: "minutes"
-                
                 if (timerValue != newValue || timerType != newType) {
                     timerValue = newValue
                     timerType = newType
@@ -125,10 +133,9 @@ class TimerService : LifecycleService() {
             override fun onDataChange(snapshot: DataSnapshot) {
                 val type = snapshot.child("type").getValue(String::class.java)
                 val status = snapshot.child("status").getValue(String::class.java)
-
                 if (type == "KDM" && status == "pending") {
                     callRef.child("status").setValue("played")
-                    showOverlay(isKdmCall = true)
+                    mainHandler.post { showOverlay(isKdmCall = true) }
                 }
             }
             override fun onCancelled(error: DatabaseError) {}
@@ -147,10 +154,21 @@ class TimerService : LifecycleService() {
                 val newEnabled = snapshot.child("enabled").getValue(Boolean::class.java) ?: false
                 if (newEnabled != lowBatteryEnabled) {
                     lowBatteryEnabled = newEnabled
-                    if (lowBatteryEnabled) {
-                        showBatteryOverlay()
-                    } else {
-                        removeBatteryOverlay()
+                    mainHandler.post {
+                        if (lowBatteryEnabled) showBatteryOverlay() else removeBatteryOverlay()
+                    }
+                }
+            }
+            override fun onCancelled(error: DatabaseError) {}
+        })
+
+        typeFaceRef.addValueEventListener(object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                val newType = snapshot.getValue(String::class.java) ?: "ghost"
+                if (typeFace != newType) {
+                    typeFace = newType
+                    if (proximityOverlayView != null) {
+                        mainHandler.post { removeProximityOverlay() }
                     }
                 }
             }
@@ -159,71 +177,108 @@ class TimerService : LifecycleService() {
     }
 
     private fun updateCameraState() {
-        if (isActive && faceSafetyEnabled) {
-            startCamera()
-        } else {
-            stopCamera()
-            removeProximityOverlay()
+        mainHandler.post {
+            if (faceSafetyEnabled) {
+                if (!isCameraStarted) startCamera()
+            } else {
+                stopCamera()
+                removeProximityOverlay()
+            }
         }
     }
 
     @OptIn(ExperimentalGetImage::class)
     private fun startCamera() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-            return
-        }
-
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) return
+        
+        isCameraStarted = true
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
-            cameraProvider = cameraProviderFuture.get()
-            val cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
-
-            val imageAnalysis = ImageAnalysis.Builder()
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .build()
-
-            val detector = FaceDetection.getClient(
-                FaceDetectorOptions.Builder()
-                    .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
-                    .build()
-            )
-
-            imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy ->
-                val mediaImage = imageProxy.image
-                if (mediaImage != null) {
-                    val image = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
-                    detector.process(image)
-                        .addOnSuccessListener { faces ->
-                            if (faces.isNotEmpty()) {
-                                val face = faces[0]
-                                val faceWidth = face.boundingBox.width()
-                                if (faceWidth > 280) { 
-                                    showProximityOverlay()
-                                } else {
-                                    removeProximityOverlay()
-                                }
-                            } else {
-                                removeProximityOverlay()
-                            }
-                        }
-                        .addOnCompleteListener {
-                            imageProxy.close()
-                        }
-                } else {
-                    imageProxy.close()
-                }
-            }
-
             try {
+                cameraProvider = cameraProviderFuture.get()
+                val cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
+                val imageAnalysis = ImageAnalysis.Builder()
+                    .setTargetResolution(Size(640, 480))
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .build()
+
+                val detector = FaceDetection.getClient(
+                    FaceDetectorOptions.Builder()
+                        .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+                        .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
+                        .build()
+                )
+
+                imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy ->
+                    val currentTime = System.currentTimeMillis()
+                    if (currentTime - lastAnalysisTime < analysisInterval) {
+                        imageProxy.close()
+                        return@setAnalyzer
+                    }
+                    lastAnalysisTime = currentTime
+
+                    val mediaImage = imageProxy.image
+                    if (mediaImage != null) {
+                        val rotation = imageProxy.imageInfo.rotationDegrees
+                        val image = InputImage.fromMediaImage(mediaImage, rotation)
+                        detector.process(image)
+                            .addOnSuccessListener { faces ->
+                                val face = faces.firstOrNull()
+                                if (face != null) {
+                                    faceLostCount = 0 
+                                    
+                                    val faceWidth = face.boundingBox.width()
+                                    val imgWidth = if (rotation == 90 || rotation == 270) imageProxy.height else imageProxy.width
+                                    val faceRatio = faceWidth.toFloat() / imgWidth
+                                    
+                                    val leftEye = face.getLandmark(FaceLandmark.LEFT_EYE)
+                                    val rightEye = face.getLandmark(FaceLandmark.RIGHT_EYE)
+                                    var eyeRatio = 0f
+                                    if (leftEye != null && rightEye != null) {
+                                        val dist = Math.hypot((leftEye.position.x - rightEye.position.x).toDouble(), 
+                                                              (leftEye.position.y - rightEye.position.y).toDouble()).toFloat()
+                                        eyeRatio = dist / imgWidth
+                                    }
+
+                                    // Threshold yang lebih realistis agar ML Kit tidak 'blind' (stuck)
+                                    if (faceRatio > 0.85f || eyeRatio > 0.38f) {
+                                        if (!isProximityActive) {
+                                            isProximityActive = true
+                                            mainHandler.post { showProximityOverlay() }
+                                        }
+                                    } else if (faceRatio < 0.70f && eyeRatio < 0.30f) {
+                                        if (isProximityActive) {
+                                            isProximityActive = false
+                                            mainHandler.post { removeProximityOverlay() }
+                                        }
+                                    }
+                                } else {
+                                    if (isProximityActive) {
+                                        faceLostCount++
+                                        if (faceLostCount >= MAX_FACE_LOST) {
+                                            isProximityActive = false
+                                            mainHandler.post { removeProximityOverlay() }
+                                        }
+                                    }
+                                }
+                            }
+                            .addOnCompleteListener { imageProxy.close() }
+                    } else {
+                        imageProxy.close()
+                    }
+                }
+
                 cameraProvider?.unbindAll()
                 cameraProvider?.bindToLifecycle(this, cameraSelector, imageAnalysis)
             } catch (e: Exception) {
-                Log.e("TimerService", "Binding failed", e)
+                isCameraStarted = false
+                Log.e("TimerService", "Camera binding failed", e)
             }
         }, ContextCompat.getMainExecutor(this))
     }
 
     private fun stopCamera() {
+        isCameraStarted = false
         cameraProvider?.unbindAll()
     }
 
@@ -231,19 +286,12 @@ class TimerService : LifecycleService() {
         countDownTimer?.cancel()
         removeOverlay()
         isTimerPaused = false
-
         if (!isActive || timerValue <= 0) {
             updateNotification("Timer Inactive")
             timeRemaining = 0L
             return
         }
-
-        timeRemaining = if (timerType == "minutes") {
-            timerValue * 60 * 1000
-        } else {
-            timerValue * 60 * 60 * 1000
-        }
-
+        timeRemaining = if (timerType == "minutes") timerValue * 60000 else timerValue * 3600000
         startCountdown(timeRemaining)
     }
 
@@ -267,17 +315,12 @@ class TimerService : LifecycleService() {
             override fun onTick(millisUntilFinished: Long) {
                 timeRemaining = millisUntilFinished
                 val seconds = (millisUntilFinished / 1000) % 60
-                val minutes = (millisUntilFinished / (1000 * 60)) % 60
-                val hours = (millisUntilFinished / (1000 * 60 * 60))
-                
-                val timeString = if (hours > 0) {
-                    String.format("%02d:%02d:%02d", hours, minutes, seconds)
-                } else {
-                    String.format("%02d:%02d", minutes, seconds)
-                }
+                val minutes = (millisUntilFinished / 60000) % 60
+                val hours = (millisUntilFinished / 3600000)
+                val timeString = if (hours > 0) String.format("%02d:%02d:%02d", hours, minutes, seconds)
+                                 else String.format("%02d:%02d", minutes, seconds)
                 updateNotification("Countdown: $timeString")
             }
-
             override fun onFinish() {
                 timeRemaining = 0L
                 updateNotification("Alert Triggered!")
@@ -288,19 +331,7 @@ class TimerService : LifecycleService() {
 
     private fun showOverlay(isKdmCall: Boolean = false) {
         if (overlayView != null) return
-
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-            else
-                WindowManager.LayoutParams.TYPE_PHONE,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.TRANSLUCENT
-        )
-        params.gravity = Gravity.CENTER
-
+        val params = getOverlayParams()
         val inflater = getSystemService(LAYOUT_INFLATER_SERVICE) as LayoutInflater
         overlayView = inflater.inflate(R.layout.overlay_layout, null)
         
@@ -313,25 +344,12 @@ class TimerService : LifecycleService() {
             videoView?.visibility = View.VISIBLE
             imageView?.visibility = View.GONE
             closeButton?.visibility = View.VISIBLE
-            val videoPath = "android.resource://" + packageName + "/" + R.raw.kdm
-            videoView?.setVideoURI(Uri.parse(videoPath))
-            videoView?.setOnPreparedListener { mp ->
-                mp.isLooping = false
-                videoView.start()
-            }
-            videoView?.setOnCompletionListener {
-                removeOverlay()
-            }
+            playVideo(videoView, R.raw.kdm, false) { removeOverlay() }
         } else if (mediaType == "video") {
             videoView?.visibility = View.VISIBLE
             imageView?.visibility = View.GONE
             closeButton?.visibility = View.VISIBLE
-            val videoPath = "android.resource://" + packageName + "/" + R.raw.video_suzzana
-            videoView?.setVideoURI(Uri.parse(videoPath))
-            videoView?.setOnPreparedListener { mp ->
-                mp.isLooping = true
-                videoView.start()
-            }
+            playVideo(videoView, R.raw.video_suzzana, true, null)
             overlayView?.postDelayed(autoCloseRunnable, 60000)
         } else {
             imageView?.visibility = View.VISIBLE
@@ -343,30 +361,16 @@ class TimerService : LifecycleService() {
         
         closeButton?.setOnClickListener {
             removeOverlay()
-            if (!isKdmCall && isActive && timerValue > 0) {
-                resetTimer()
-            }
+            if (!isKdmCall && isActive && timerValue > 0) resetTimer()
         }
-
-        windowManager?.addView(overlayView, params)
+        addViewSafely(overlayView, params)
     }
 
     private fun showProximityOverlay() {
-        if (proximityOverlayView != null) return
+        if (proximityOverlayView != null || batteryOverlayView != null || overlayView != null) return
 
         pauseTimer()
-
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-            else
-                WindowManager.LayoutParams.TYPE_PHONE,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.TRANSLUCENT
-        )
-
+        val params = getOverlayParams()
         val inflater = getSystemService(LAYOUT_INFLATER_SERVICE) as LayoutInflater
         proximityOverlayView = inflater.inflate(R.layout.overlay_layout, null)
         
@@ -376,37 +380,21 @@ class TimerService : LifecycleService() {
         
         imageView?.visibility = View.GONE
         closeButton?.visibility = View.GONE
-        videoView?.visibility = View.VISIBLE
         
-        val videoPath = "android.resource://" + packageName + "/" + R.raw.warning_face
-        videoView?.setVideoURI(Uri.parse(videoPath))
-        videoView?.setOnPreparedListener { mp ->
-            mp.isLooping = false
-            videoView.start()
+        if (typeFace == "blank") {
+            videoView?.visibility = View.GONE
+        } else {
+            videoView?.visibility = View.VISIBLE
+            val resId = if (typeFace == "monkey") R.raw.monkey_face else R.raw.warning_face
+            playVideo(videoView, resId, true, null)
         }
-        videoView?.setOnCompletionListener {
-            removeProximityOverlay()
-        }
-
-        windowManager?.addView(proximityOverlayView, params)
+        addViewSafely(proximityOverlayView, params)
     }
 
     private fun showBatteryOverlay() {
         if (batteryOverlayView != null) return
-
         pauseTimer()
-
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-            else
-                WindowManager.LayoutParams.TYPE_PHONE,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.TRANSLUCENT
-        )
-
+        val params = getOverlayParams()
         val inflater = getSystemService(LAYOUT_INFLATER_SERVICE) as LayoutInflater
         batteryOverlayView = inflater.inflate(R.layout.overlay_layout, null)
         
@@ -417,28 +405,45 @@ class TimerService : LifecycleService() {
         imageView?.visibility = View.GONE
         closeButton?.visibility = View.GONE
         videoView?.visibility = View.VISIBLE
+        playVideo(videoView, R.raw.low_battery, true, null)
         
-        val videoPath = "android.resource://" + packageName + "/" + R.raw.low_battery
-        videoView?.setVideoURI(Uri.parse(videoPath))
-        videoView?.setOnPreparedListener { mp ->
-            mp.isLooping = true
-            videoView.start()
-        }
-
-        windowManager?.addView(batteryOverlayView, params)
-        
-        // Auto close after 3 minutes (180,000 ms)
+        addViewSafely(batteryOverlayView, params)
         batteryOverlayView?.postDelayed(batteryAutoCloseRunnable, 180000)
+    }
+
+    private fun playVideo(videoView: VideoView?, resId: Int, looping: Boolean, onComplete: (() -> Unit)?) {
+        try {
+            videoView?.apply {
+                setVideoURI(Uri.parse("android.resource://$packageName/$resId"))
+                setOnPreparedListener { it.isLooping = looping; it.setVolume(1f, 1f); start() }
+                setOnCompletionListener { onComplete?.invoke() }
+                setOnErrorListener { _, _, _ -> true }
+            }
+        } catch (e: Exception) { Log.e("TimerService", "Video play failed", e) }
+    }
+
+    private fun getOverlayParams() = WindowManager.LayoutParams(
+        WindowManager.LayoutParams.MATCH_PARENT,
+        WindowManager.LayoutParams.MATCH_PARENT,
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        else WindowManager.LayoutParams.TYPE_PHONE,
+        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
+        PixelFormat.TRANSLUCENT
+    ).apply { gravity = Gravity.CENTER }
+
+    private fun addViewSafely(view: View?, params: WindowManager.LayoutParams) {
+        mainHandler.post {
+            try { 
+                if (view != null && view.parent == null) windowManager?.addView(view, params)
+            } catch (e: Exception) { Log.e("TimerService", "Add view failed", e) }
+        }
     }
 
     private fun removeBatteryOverlay() {
         batteryOverlayView?.let {
-            val videoView = it.findViewById<VideoView>(R.id.overlay_video)
-            videoView?.stopPlayback()
+            it.findViewById<VideoView>(R.id.overlay_video)?.stopPlayback()
             it.removeCallbacks(batteryAutoCloseRunnable)
-            try {
-                windowManager?.removeView(it)
-            } catch (e: Exception) {}
+            try { windowManager?.removeView(it) } catch (e: Exception) {}
             batteryOverlayView = null
             resumeTimer()
         }
@@ -446,11 +451,8 @@ class TimerService : LifecycleService() {
 
     private fun removeProximityOverlay() {
         proximityOverlayView?.let {
-            val videoView = it.findViewById<VideoView>(R.id.overlay_video)
-            videoView?.stopPlayback()
-            try {
-                windowManager?.removeView(it)
-            } catch (e: Exception) {}
+            it.findViewById<VideoView>(R.id.overlay_video)?.stopPlayback()
+            try { windowManager?.removeView(it) } catch (e: Exception) {}
             proximityOverlayView = null
             resumeTimer()
         }
@@ -458,12 +460,9 @@ class TimerService : LifecycleService() {
 
     private fun removeOverlay() {
         overlayView?.let {
-            val videoView = it.findViewById<VideoView>(R.id.overlay_video)
-            videoView?.stopPlayback()
+            it.findViewById<VideoView>(R.id.overlay_video)?.stopPlayback()
             it.removeCallbacks(autoCloseRunnable)
-            try {
-                windowManager?.removeView(it)
-            } catch (e: Exception) {}
+            try { windowManager?.removeView(it) } catch (e: Exception) {}
             overlayView = null
             resumeTimer()
         }
@@ -471,43 +470,27 @@ class TimerService : LifecycleService() {
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val serviceChannel = NotificationChannel(
-                CHANNEL_ID,
-                "Timer Service Channel",
-                NotificationManager.IMPORTANCE_LOW
-            )
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(serviceChannel)
+            val channel = NotificationChannel(CHANNEL_ID, "Child Alert Service", NotificationManager.IMPORTANCE_LOW)
+            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
     }
 
-    private fun updateNotification(contentText: String) {
-        val notificationIntent = Intent(this, MainActivity::class.java)
-        val pendingIntent = PendingIntent.getActivity(
-            this, 0, notificationIntent,
-            PendingIntent.FLAG_IMMUTABLE
-        )
-
+    private fun updateNotification(text: String) {
+        val intent = Intent(this, MainActivity::class.java)
+        val pendingIntent = PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_IMMUTABLE)
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Child Alert Timer")
-            .setContentText(contentText)
-            .setSmallIcon(R.drawable.duck)
-            .setContentIntent(pendingIntent)
-            .build()
-
+            .setContentTitle("Child Alert Timer").setContentText(text)
+            .setSmallIcon(R.drawable.duck).setContentIntent(pendingIntent)
+            .setOngoing(true).build()
         startForeground(NOTIFICATION_ID, notification)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
-        updateNotification("Timer Service Running")
         return START_STICKY
     }
 
-    override fun onBind(intent: Intent): IBinder? {
-        super.onBind(intent)
-        return null
-    }
+    override fun onBind(intent: Intent): IBinder? { super.onBind(intent); return null }
 
     override fun onDestroy() {
         countDownTimer?.cancel()
